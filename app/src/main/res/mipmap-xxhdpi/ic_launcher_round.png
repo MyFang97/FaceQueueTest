@@ -1,0 +1,334 @@
+package com.visualdeep.faceapp;
+
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+
+import android.Manifest;
+import android.content.pm.ActivityInfo;
+import android.content.pm.PackageManager;
+import android.content.res.Configuration;
+import android.graphics.Bitmap;
+import android.graphics.Point;
+import android.hardware.Camera;
+import android.media.FaceDetector;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.util.DisplayMetrics;
+import android.util.Log;
+import android.view.Surface;
+import android.view.View;
+import android.view.ViewTreeObserver;
+import android.view.Window;
+import android.view.WindowManager;
+import android.widget.Toast;
+
+import com.visualdeep.libs.bean.DrawInfo;
+import com.visualdeep.libs.bean.FaceBean;
+import com.visualdeep.libs.bean.FaceConfig;
+import com.visualdeep.libs.process.FaceListener;
+import com.visualdeep.libs.process.FaceProcess;
+import com.visualdeep.libs.process.RectListener;
+import com.visualdeep.libs.util.BitmapUtils;
+import com.visualdeep.libs.util.DrawHelper;
+import com.visualdeep.libs.util.NV21ToBitmap;
+import com.visualdeep.libs.util.StorageUtils;
+import com.visualdeep.libs.util.camera.CameraHelper;
+import com.visualdeep.libs.util.camera.CameraListener;
+import com.visualdeep.libs.view.FaceRectView;
+import com.viwo.android.FaceDetect;
+import com.viwo.video.VpxCoder;
+import android.os.Build;
+
+import java.util.List;
+import java.util.concurrent.ArrayBlockingQueue;
+
+public class MainActivity extends AppCompatActivity implements FaceListener, RectListener , ViewTreeObserver.OnGlobalLayoutListener {
+
+    private float fpsTimes = 1000f / 10f ;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        requestWindowFeature(Window.FEATURE_NO_TITLE);
+        setContentView(R.layout.activity_main);
+
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+            WindowManager.LayoutParams attributes = getWindow().getAttributes();
+            attributes.systemUiVisibility = View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION;
+            getWindow().setAttributes(attributes);
+        }
+
+        // Activity启动后就锁定为启动时的方向
+        switch (getResources().getConfiguration().orientation) {
+            case Configuration.ORIENTATION_PORTRAIT:
+                setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
+                break;
+            case Configuration.ORIENTATION_LANDSCAPE:
+                setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
+                break;
+            default:
+                break;
+        }
+
+        faceRectView = findViewById(R.id.face_rect_view);
+        previewView = findViewById(R.id.texture_preview);
+        nv21ToBitmap = new NV21ToBitmap( this );
+        previewView.getViewTreeObserver().addOnGlobalLayoutListener(this);
+
+    }
+
+    private boolean checkPermissions(String[] neededPermissions) {
+        if (neededPermissions == null || neededPermissions.length == 0) {
+            return true;
+        }
+        boolean allGranted = true;
+        for (String neededPermission : neededPermissions) {
+            allGranted &= ContextCompat.checkSelfPermission(this.getApplicationContext(), neededPermission) == PackageManager.PERMISSION_GRANTED;
+        }
+        return allGranted;
+    }
+
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (cameraHelper != null) {
+            cameraHelper.release();
+            cameraHelper = null;
+        }
+        super.onDestroy();
+    }
+
+
+    private void initCamera() {
+        DisplayMetrics metrics = new DisplayMetrics();
+        getWindowManager().getDefaultDisplay().getMetrics(metrics);
+
+        CameraListener cameraListener = new CameraListener() {
+            @Override
+            public void onCameraOpened(Camera camera, int cameraId, int displayOrientation, boolean isMirror) {
+                Log.i(TAG, "onCameraOpened: " + cameraId + "  " + displayOrientation + " " + isMirror);
+                previewSize = camera.getParameters().getPreviewSize();
+                drawHelper = new DrawHelper(previewSize.width, previewSize.height, previewView.getWidth(), previewView.getHeight()
+                        , displayOrientation
+                        , cameraId, false );
+            }
+
+
+            @Override
+            public void onPreview(byte[] nv21, Camera camera) {
+                long newTime = System.currentTimeMillis();
+                long times = newTime - oldTime;
+                if(times < fpsTimes ){
+                    return;
+                }
+                if( mDrawQueue.remainingCapacity() == 0 )
+                    mDrawQueue.remove();
+                mDrawQueue.add( nv21 );
+            }
+
+            @Override
+            public void onCameraClosed() {
+                Log.i(TAG, "onCameraClosed: ");
+            }
+
+            @Override
+            public void onCameraError(Exception e) {
+                Log.i(TAG, "onCameraError: " + e.getMessage());
+            }
+
+            @Override
+            public void onCameraConfigurationChanged(int cameraID, int displayOrientation) {
+                if (drawHelper != null) {
+                    drawHelper.setCameraDisplayOrientation(displayOrientation);
+                }
+                Log.i(TAG, "onCameraConfigurationChanged: " + cameraID + "  " + displayOrientation);
+            }
+        };
+
+        initDevice();
+
+        cameraHelper = new CameraHelper.Builder()
+                .previewSize(new Point( width , height ))
+                .previewViewSize(new Point( previewView.getMeasuredWidth() , previewView.getMeasuredHeight() ))
+                .rotation( cameraRotation )
+                .specificCameraId(cameraID != null ? cameraID : Camera.CameraInfo.CAMERA_FACING_FRONT )
+                .isMirror(false)
+                .previewOn(previewView)
+                .cameraListener(cameraListener)
+                .build();
+
+        cameraHelper.init();
+    }
+
+    private void initDevice()
+    {
+        String board  = Build.BOARD;
+        width = previewView.getMeasuredWidth() ;
+        height = previewView.getMeasuredHeight() ;
+        cameraRotation = getWindowManager().getDefaultDisplay().getRotation();
+        bitmapRotation = 0;
+    }
+
+    public class DrawThread extends Thread {
+
+        private final static String NAME = "DrawThread";
+
+        public DrawThread(String name) {
+            super(name);
+        }
+
+        @Override
+        public void run() {
+            Log.d(TAG, Thread.currentThread().getName());
+            int count = 0;
+            int mt1 = 0;
+            int mt2 = 0;
+            while( isRunning )
+            {
+                if( !mDrawQueue.isEmpty() )
+                {
+                    byte[] nv21 = mDrawQueue.poll();
+
+                    if( !init )
+                    {
+                       init = true;
+                       yuv = new byte[ previewSize.width * previewSize.height * 3 / 2];
+                       yuvr = new byte[ previewSize.width * previewSize.height * 3 / 2 ];
+                       rgb = new byte[ previewSize.width * previewSize.height * 3 ];
+                       rgba = new byte[ previewSize.width * previewSize.height * 4 ];
+                    }
+                   count++;
+
+
+                      long t2 = System.currentTimeMillis();
+                      vpxCoder.NV212RGB24( nv21 , rgb, 24 , previewSize.width, previewSize.height );
+                      vpxCoder.NV21ToI420( nv21 , yuv , previewSize.width, previewSize.height );
+                      vpxCoder.YUV4202RGB( yuv, rgba , 32 , previewSize.width, previewSize.height );
+
+
+                      final List<DrawInfo> faces = FaceProcess.getInst().detectFaceEx( rgba , rgb , previewSize.width, previewSize.height , 3 , 48 , ""  );
+                      long t22 = System.currentTimeMillis() - t2 ;
+                      mt2 += t22;
+
+                      Log.d("TAG" , "mt1=" + mt1/count + ",mt2=" + mt2/count);
+                      Handler mainHandler = new Handler(Looper.getMainLooper());
+                      mainHandler.post(new Runnable() {
+                        @Override
+                        public void run() {
+                          if (faceRectView != null && drawHelper != null) {
+                            drawHelper.draw(faceRectView, faces );
+                          }
+                        }
+                      });
+
+                }
+                else
+                {
+                    try {
+                        Thread.sleep( 10 );
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+                }
+            }
+        }
+    };
+
+    //初始化
+    private void init()
+    {
+        FaceDetect.getFaceUtil(MainActivity.this , passcode );
+        FaceConfig faceConfig = new FaceConfig( true ,this , true , 0.95f );
+        FaceProcess.getInst().init( faceConfig );
+        faceConfig.rectListener = this;
+        if( drawThread == null )
+        {
+            drawThread = new DrawThread( "DrawThread" );
+            drawThread.start();
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == ACTION_REQUEST_PERMISSIONS) {
+            boolean isAllGranted = true;
+            for (int grantResult : grantResults) {
+                isAllGranted &= (grantResult == PackageManager.PERMISSION_GRANTED);
+            }
+            if (isAllGranted) {
+                init();
+                initCamera();
+            } else {
+                Toast.makeText(this.getApplicationContext(), "拒绝" , Toast.LENGTH_SHORT).show();
+            }
+        }
+    }
+
+    @Override
+    public boolean compareFace(FaceBean faceBean) {
+        return false;
+    }
+
+    @Override
+    public DrawInfo process(DrawInfo drawInfo) {
+        drawInfo.setName("36.5℃");
+        return drawInfo;
+    }
+
+    @Override
+    public void onGlobalLayout() {
+        previewView.getViewTreeObserver().removeOnGlobalLayoutListener(this);
+        if (!checkPermissions(NEEDED_PERMISSIONS)) {
+            ActivityCompat.requestPermissions(this, NEEDED_PERMISSIONS, ACTION_REQUEST_PERMISSIONS);
+        } else {
+            init();
+            initCamera();
+        }
+    }
+
+    private static final String TAG = "MainActivity";
+    /**
+     * 相机预览显示的控件，可为SurfaceView或TextureView
+     */
+
+    private boolean isRunning = true;
+
+    private int width = 640;
+    private int height = 480;
+    private int cameraRotation = Surface.ROTATION_0;
+    private int bitmapRotation = 0;
+
+    private ArrayBlockingQueue<byte[]> mDrawQueue = new ArrayBlockingQueue<byte[]>( 10 );;
+    private FaceRectView faceRectView;
+    private View previewView;
+    private DrawHelper drawHelper;
+    private Camera.Size previewSize;
+    private Integer cameraID = Camera.CameraInfo.CAMERA_FACING_BACK;
+    private CameraHelper cameraHelper;
+    private NV21ToBitmap nv21ToBitmap;
+    private long oldTime = 0;
+    private static final int ACTION_REQUEST_PERMISSIONS = 0x001;
+    private DrawThread drawThread = null;
+    private boolean init = false;
+    private byte[] yuv ;
+    private byte[] yuvr ;
+    private byte[] rgb ;
+    private byte[] rgba ;
+    public static VpxCoder vpxCoder = VpxCoder.getInstance();
+
+    private static Str
